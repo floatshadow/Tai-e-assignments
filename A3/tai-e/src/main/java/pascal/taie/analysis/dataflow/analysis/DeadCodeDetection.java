@@ -33,21 +33,14 @@ import pascal.taie.analysis.graph.cfg.CFGBuilder;
 import pascal.taie.analysis.graph.cfg.Edge;
 import pascal.taie.config.AnalysisConfig;
 import pascal.taie.ir.IR;
-import pascal.taie.ir.exp.ArithmeticExp;
-import pascal.taie.ir.exp.ArrayAccess;
-import pascal.taie.ir.exp.CastExp;
-import pascal.taie.ir.exp.FieldAccess;
-import pascal.taie.ir.exp.NewExp;
-import pascal.taie.ir.exp.RValue;
-import pascal.taie.ir.exp.Var;
+import pascal.taie.ir.exp.*;
 import pascal.taie.ir.stmt.AssignStmt;
 import pascal.taie.ir.stmt.If;
 import pascal.taie.ir.stmt.Stmt;
 import pascal.taie.ir.stmt.SwitchStmt;
+import pascal.taie.util.collection.Pair;
 
-import java.util.Comparator;
-import java.util.Set;
-import java.util.TreeSet;
+import java.util.*;
 
 public class DeadCodeDetection extends MethodAnalysis {
 
@@ -69,8 +62,80 @@ public class DeadCodeDetection extends MethodAnalysis {
                 ir.getResult(LiveVariableAnalysis.ID);
         // keep statements (dead code) sorted in the resulting set
         Set<Stmt> deadCode = new TreeSet<>(Comparator.comparing(Stmt::getIndex));
-        // TODO - finish me
-        // Your task is to recognize dead code in ir and add it to deadCode
+        // control-flow unreachable code, pessimistic analysis.
+        // first assume all nodes are unreachable, then try to prove live nodes are reachable.
+
+        Set<Stmt> liveNodes = new HashSet<>();
+        Queue<Stmt> worklist = new LinkedList<>();
+        // entry and exit should be reachable
+        worklist.add(cfg.getEntry());
+        worklist.add(cfg.getExit());
+        while (!worklist.isEmpty()) {
+            Stmt node = worklist.remove();
+            if (liveNodes.contains(node)) {
+                continue;
+            }
+            // mark reachable
+            liveNodes.add(node);
+            // unreachable branch analysis
+            if (node instanceof If) {
+                ConditionExp cond = ((If) node).getCondition();
+                Value condVal = ConstantPropagation.evaluate(cond, constants.getInFact(node));
+                if (condVal.isConstant()) {
+                    Set<Edge<Stmt>> edges = cfg.getOutEdgesOf(node);
+                    // only false branch reachable.
+                    if (condVal.getConstant() == 0) {
+                        for (Edge<Stmt> edge : edges) {
+                            if (edge.getKind() == Edge.Kind.IF_FALSE) {
+                                worklist.add(edge.getTarget());
+                            }
+                        }
+                    } else {
+                        // only true branch is reachable
+                        worklist.add(((If) node).getTarget());
+                    }
+                    continue;
+                }
+            } else if (node instanceof SwitchStmt) {
+                Var condVar = ((SwitchStmt) node).getVar();
+                Value condVal = ConstantPropagation.evaluate(condVar, constants.getInFact(node));
+                if (condVal.isConstant()) {
+                    int cond = condVal.getConstant();
+                    boolean fallback = true;
+                    for (Pair<Integer, Stmt> case_target : ((SwitchStmt) node).getCaseTargets()) {
+                        Integer caseVal = case_target.first();
+                        Stmt target = case_target.second();
+                        if (caseVal.equals(cond)) {
+                            worklist.add(target);
+                            fallback = false;
+                        }
+                    }
+                    // only default branch is reachable.
+                    if (fallback) {
+                        worklist.add(((SwitchStmt) node).getDefaultTarget());
+                    }
+                    continue;
+                }
+            } else if (node instanceof AssignStmt) {
+                // check useless assignment
+                LValue lvalue = ((AssignStmt<?, ?>) node).getLValue();
+                RValue rvalue = ((AssignStmt<?, ?>) node).getRValue();
+                if (lvalue instanceof Var x &&
+                        !liveVars.getOutFact(node).contains(x) &&
+                        hasNoSideEffect(rvalue)
+                ) {
+                    // reachable, but can be removed
+                    deadCode.add(node);
+                }
+            }
+            // conservative estimation
+            worklist.addAll(cfg.getSuccsOf(node));
+        }
+        for (Stmt node : cfg.getNodes()) {
+            if (!liveNodes.contains(node)) {
+                deadCode.add(node);
+            }
+        }
         return deadCode;
     }
 
